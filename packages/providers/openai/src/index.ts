@@ -16,6 +16,7 @@ import {
 } from '@prisma-bot/shared';
 import {
   type OpenAIChatCompletionsArgs,
+  type OpenAIResponsesArgs,
   type OpenAITextCompletionArgs,
   createOpenAIClient,
 } from './client.js';
@@ -81,6 +82,117 @@ export function resolveTokenParam(
   if (override === 'max_completion_tokens') return 'max_completion_tokens';
   // auto: delegate to the shared reasoning-family detector.
   return isReasoningModel(model) ? 'max_completion_tokens' : 'max_tokens';
+}
+
+// ---------------------------------------------------------------------------
+// API-style resolution: which OpenAI endpoint carries the review request
+// ---------------------------------------------------------------------------
+
+/**
+ * `RESPONSES_ONLY_TOOLS_RE`, the model families that reject function tools on
+ * `/chat/completions` and must use `/responses` instead.
+ *
+ * The API says so itself, and names both remedies:
+ *   "Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+ *    /v1/chat/completions. To use function tools, use /v1/responses or set
+ *    reasoning_effort to 'none'."
+ *
+ * `reasoning_effort: 'none'` is not a remedy for this flow: it clears the 400
+ * and then costs review quality (see docs/model-compatibility.md), and OpenAI's
+ * own model guide states that the next family "does not support the `none`
+ * reasoning effort" while "tool calling requires Responses". So the routing is
+ * the remedy, and this regex is the set of families that need it:
+ *   - `gpt-5.6*`            : sol, terra, luna
+ *   - `gpt-[6-9]`, `gpt-\d{2,}` : later majors, same restriction
+ *
+ * Models that still accept function tools on `/chat/completions` (gpt-5.5 and
+ * earlier, the o-series, and every classic family) are deliberately NOT matched:
+ * they work today, and routing them would change a working path. Operators who
+ * want `/responses` everywhere set `OPENAI_API_STYLE=responses`.
+ */
+const RESPONSES_ONLY_TOOLS_RE = /^(gpt-5\.6|gpt-[6-9]|gpt-\d{2,})/i;
+
+/**
+ * `ApiStyle`, the three possible endpoint selections for `review()`.
+ *
+ *   - `'auto'`      : heuristic (default); `/responses` for the families that
+ *                     reject function tools on `/chat/completions`.
+ *   - `'chat'`      : always `/chat/completions` (the pre-Responses behavior).
+ *   - `'responses'` : always `/responses`.
+ *
+ * Operators set this via `OPENAI_API_STYLE` (deployment.md § Config).
+ */
+export type ApiStyle = 'auto' | 'chat' | 'responses';
+
+/**
+ * `resolveApiStyle`, a pure helper mapping a model identifier plus an optional
+ * operator override to the endpoint `review()` will use.
+ *
+ * @param model    - Bare model identifier (no `provider/` prefix).
+ * @param override - Operator override from `OPENAI_API_STYLE`. Defaults to
+ *                   `'auto'`, which runs the heuristic.
+ *
+ * @returns `'responses'` or `'chat'`.
+ *
+ * Exported for direct unit-testing.
+ */
+export function resolveApiStyle(model: string, override: ApiStyle = 'auto'): 'chat' | 'responses' {
+  if (override === 'chat') return 'chat';
+  if (override === 'responses') return 'responses';
+  return RESPONSES_ONLY_TOOLS_RE.test(model) ? 'responses' : 'chat';
+}
+
+/**
+ * `toResponsesArgs`, a pure mapping from the `/chat/completions` request Prisma
+ * already builds to the `/responses` request shape.
+ *
+ * Only the spelling changes; every value is carried over:
+ *   - system message  -> `instructions` (multiple system messages are joined)
+ *   - remaining turns -> `input`
+ *   - nested tool     -> flat tool (`{ type, name, description, parameters }`)
+ *   - forced tool     -> `{ type: 'function', name }`; `'required'` unchanged
+ *   - token cap       -> `max_output_tokens` (whichever chat spelling was set)
+ *   - `store: false`  -> Prisma does not use server-side response retention
+ *
+ * Passthrough keys from `provider_options.openai` (spec § 5.3) ride along
+ * untouched, exactly as they do on the chat path.
+ *
+ * Exported for direct unit-testing.
+ */
+export function toResponsesArgs(args: OpenAIChatCompletionsArgs): OpenAIResponsesArgs {
+  const { messages, tools, tool_choice, max_tokens, max_completion_tokens, ...passthrough } = args;
+
+  const instructions = messages
+    .filter((m) => m.role === 'system')
+    .map((m) => m.content)
+    .join('\n\n');
+  const input = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+  const responsesArgs: OpenAIResponsesArgs = {
+    ...passthrough,
+    model: args.model,
+    instructions,
+    input,
+    tools: tools.map((t) => ({
+      type: 'function' as const,
+      name: t.function.name,
+      description: t.function.description,
+      parameters: t.function.parameters,
+    })),
+    tool_choice:
+      tool_choice === 'required'
+        ? 'required'
+        : { type: 'function' as const, name: tool_choice.function.name },
+    store: false,
+  };
+
+  const cap = max_completion_tokens ?? max_tokens;
+  if (cap !== undefined) {
+    responsesArgs.max_output_tokens = cap;
+  }
+  return responsesArgs;
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +475,15 @@ export interface OpenAIClientLike {
     seed?: number;
   }): Promise<unknown>;
   /**
+   * `/responses` call, used by `review()` for the model families that reject
+   * function tools on `/chat/completions` (see `resolveApiStyle`).
+   *
+   * Optional so that an injected client predating the Responses support still
+   * satisfies this shape; `review()` falls back to `chatCompletions` when the
+   * method is absent. `createOpenAIClient` always provides it.
+   */
+  responses?(args: OpenAIResponsesArgs): Promise<unknown>;
+  /**
    * Plain-text (no tools) completion — used by `respond()`
    * (reviewer-interaction, `@bot ask <message>`). See `OpenAITextCompletionArgs`.
    */
@@ -411,6 +532,16 @@ export interface OpenAIProviderOptions {
    * Wired from OPENAI_TOOL_CHOICE env var (deployment.md - Config).
    */
   toolChoiceStyle?: ToolChoiceStyle;
+  /**
+   * `apiStyle` controls which endpoint `review()` posts to. Defaults to
+   * `'auto'`, which sends the model families that reject function tools on
+   * `/chat/completions` (gpt-5.6*, gpt-6+) to `/responses` and leaves every
+   * other model on `/chat/completions`. `'chat'` pins the old behavior;
+   * `'responses'` uses `/responses` for every model.
+   *
+   * Wired from OPENAI_API_STYLE env var (deployment.md - Config).
+   */
+  apiStyle?: ApiStyle;
 }
 
 interface ToolCall {
@@ -493,6 +624,87 @@ function extractToolCallArguments(response: unknown, toolName: string): unknown 
   });
 }
 
+/**
+ * Extract the tool-call arguments from a `/responses` response.
+ *
+ * The Responses API returns the call as an item in the top-level `output`
+ * array (`{ type: 'function_call', name, arguments }`) rather than under
+ * `choices[0].message.tool_calls`. Errors mirror `extractToolCallArguments`
+ * so the orchestrator sees the same `schema_validation` shape either way.
+ */
+function extractResponsesToolCallArguments(response: unknown, toolName: string): unknown {
+  if (typeof response !== 'object' || response === null) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: 'openai response was not an object',
+    });
+  }
+  const output = (response as Record<string, unknown>).output;
+  if (!Array.isArray(output)) {
+    throw new ProviderErrorThrowable({
+      kind: 'schema_validation',
+      message: `openai response missing output array for tool '${toolName}'`,
+    });
+  }
+  for (const item of output) {
+    if (typeof item !== 'object' || item === null) continue;
+    const record = item as Record<string, unknown>;
+    if (record.type !== 'function_call' || record.name !== toolName) continue;
+    const rawArgs = record.arguments;
+    if (typeof rawArgs === 'string') {
+      try {
+        return JSON.parse(rawArgs);
+      } catch {
+        throw new ProviderErrorThrowable({
+          kind: 'schema_validation',
+          message: 'openai tool_call arguments was not valid JSON',
+        });
+      }
+    }
+    return rawArgs;
+  }
+  throw new ProviderErrorThrowable({
+    kind: 'schema_validation',
+    message: `openai response missing tool_call for tool '${toolName}'`,
+  });
+}
+
+/**
+ * Detect an output-cap truncation on either endpoint.
+ *
+ * `/chat/completions` reports it as `choices[0].finish_reason === 'length'`;
+ * `/responses` reports it as `status: 'incomplete'` with
+ * `incomplete_details.reason === 'max_output_tokens'`.
+ */
+function isOutputTruncated(response: unknown): boolean {
+  if (typeof response !== 'object' || response === null) {
+    return false;
+  }
+  const record = response as Record<string, unknown>;
+  const choices = record.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const firstChoice = choices[0];
+    if (
+      typeof firstChoice === 'object' &&
+      firstChoice !== null &&
+      (firstChoice as Record<string, unknown>).finish_reason === 'length'
+    ) {
+      return true;
+    }
+  }
+  if (record.status === 'incomplete') {
+    const details = record.incomplete_details;
+    if (
+      typeof details === 'object' &&
+      details !== null &&
+      (details as Record<string, unknown>).reason === 'max_output_tokens'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Extract the plain-text assistant reply from a chat-completions response (no tools). */
 function extractMessageContent(response: unknown): string {
   if (typeof response !== 'object' || response === null) {
@@ -570,6 +782,7 @@ export class OpenAIProvider implements Provider {
   private readonly tokenParamStyle: TokenParamStyle;
   private readonly maxOutputTokens: number;
   private readonly toolChoiceStyle: ToolChoiceStyle;
+  private readonly apiStyle: ApiStyle;
 
   constructor(options: OpenAIProviderOptions) {
     this.model = options.model ?? OPENAI_DEFAULT_MODEL;
@@ -585,6 +798,7 @@ export class OpenAIProvider implements Provider {
     this.tokenParamStyle = options.tokenParamStyle ?? 'auto';
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
     this.toolChoiceStyle = options.toolChoiceStyle ?? 'auto';
+    this.apiStyle = options.apiStyle ?? 'auto';
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
@@ -717,9 +931,20 @@ export class OpenAIProvider implements Provider {
       args = merged;
     }
 
+    // D4: select the endpoint for the resolved model. `/responses` is used for
+    // the families that reject function tools on `/chat/completions`; the
+    // `OPENAI_API_STYLE` env var (→ `this.apiStyle`) overrides the heuristic.
+    // An injected client without a `responses` method keeps the chat path.
+    const responsesCall = this.client.responses?.bind(this.client);
+    const useResponses =
+      resolveApiStyle(model, this.apiStyle) === 'responses' && responsesCall !== undefined;
+
     let response: unknown;
     try {
-      response = await this.client.chatCompletions(args);
+      response =
+        responsesCall !== undefined && useResponses
+          ? await responsesCall(toResponsesArgs(args))
+          : await this.client.chatCompletions(args);
     } catch (err) {
       if (err instanceof ProviderErrorThrowable) {
         throw err;
@@ -727,36 +952,23 @@ export class OpenAIProvider implements Provider {
       throw new ProviderErrorThrowable(mapOpenAIError(err));
     }
 
-    // Detect response truncation: finish_reason==='length' means the model hit
-    // the output token cap and the output may be a partial/invalid findings
-    // array. Throw output_truncated so the orchestrator can split-and-retry
-    // instead of dropping the batch's findings (chunking-stability-spec.md
-    // § Phase 1). The message is param- and value-agnostic so it accurately
-    // reflects whatever token field was in play (max_tokens or
-    // max_completion_tokens).
-    if (
-      typeof response === 'object' &&
-      response !== null &&
-      Array.isArray((response as Record<string, unknown>).choices) &&
-      ((response as Record<string, unknown>).choices as unknown[])[0] !== undefined
-    ) {
-      const firstChoice = (
-        (response as Record<string, unknown>).choices as Record<string, unknown>[]
-      )[0];
-      if (
-        typeof firstChoice === 'object' &&
-        firstChoice !== null &&
-        (firstChoice as Record<string, unknown>).finish_reason === 'length'
-      ) {
-        throw new ProviderErrorThrowable({
-          kind: 'output_truncated',
-          message: `openai response truncated: finish_reason is 'length' (output token cap: ${this.maxOutputTokens})`,
-          requested_max_tokens: this.maxOutputTokens,
-        });
-      }
+    // Detect response truncation: the model hit the output token cap and the
+    // output may be a partial/invalid findings array. Throw output_truncated so
+    // the orchestrator can split-and-retry instead of dropping the batch's
+    // findings (chunking-stability-spec.md § Phase 1). The message is param-
+    // and value-agnostic so it accurately reflects whatever token field was in
+    // play (max_tokens, max_completion_tokens or max_output_tokens).
+    if (isOutputTruncated(response)) {
+      throw new ProviderErrorThrowable({
+        kind: 'output_truncated',
+        message: `openai response truncated: the model hit the output token cap (${this.maxOutputTokens})`,
+        requested_max_tokens: this.maxOutputTokens,
+      });
     }
 
-    const toolArgs = extractToolCallArguments(response, prompt.tool.function.name);
+    const toolArgs = useResponses
+      ? extractResponsesToolCallArguments(response, prompt.tool.function.name)
+      : extractToolCallArguments(response, prompt.tool.function.name);
     const parsed = ProviderReviewOutputSchema.safeParse(toolArgs);
     if (!parsed.success) {
       throw new ProviderErrorThrowable({

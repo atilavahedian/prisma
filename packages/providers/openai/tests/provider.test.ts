@@ -13,6 +13,7 @@ import {
   type OpenAIClientLike,
   OpenAIProvider,
   applyProviderOptions,
+  resolveApiStyle,
   resolveTokenParam,
   resolveToolChoice,
 } from '../src/index.js';
@@ -1227,5 +1228,173 @@ describe('OpenAIProvider — extractToolCallArguments works with required tool_c
     const out = await provider.review({ ...validInput, request_shaping: { model: 'o3' } });
     expect(out.findings).toHaveLength(1);
     expect(out.findings[0]?.message).toBe('reasoning finding');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Responses API routing: function tools are rejected on /chat/completions for
+// the gpt-5.6 families (Rynaro/prisma#40).
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProvider, /responses routing', () => {
+  function responsesResponse(toolArgs: unknown, toolName = 'submit_review_findings') {
+    return {
+      id: 'resp-fake',
+      status: 'completed',
+      output: [
+        { type: 'reasoning', summary: [] },
+        {
+          type: 'function_call',
+          call_id: 'call_1',
+          name: toolName,
+          // OpenAI returns `arguments` as a JSON-encoded string.
+          arguments: JSON.stringify(toolArgs),
+        },
+      ],
+    };
+  }
+
+  function makeDualClient(): {
+    client: OpenAIClientLike;
+    getChatArgs: () => Record<string, unknown>;
+    getResponsesArgs: () => Record<string, unknown>;
+  } {
+    let chatArgs: Record<string, unknown> = {};
+    let responsesArgs: Record<string, unknown> = {};
+    const client: OpenAIClientLike = {
+      chatCompletions: vi.fn().mockImplementation((args: unknown) => {
+        chatArgs = args as Record<string, unknown>;
+        return Promise.resolve(chatCompletionsResponse({ findings: [] }));
+      }),
+      responses: vi.fn().mockImplementation((args: unknown) => {
+        responsesArgs = args as Record<string, unknown>;
+        return Promise.resolve(responsesResponse({ findings: [] }));
+      }),
+      textCompletion: vi.fn(),
+    };
+    return { client, getChatArgs: () => chatArgs, getResponsesArgs: () => responsesArgs };
+  }
+
+  it('resolveApiStyle routes only the affected families to /responses', () => {
+    expect(resolveApiStyle('gpt-5.6-luna')).toBe('responses');
+    expect(resolveApiStyle('gpt-5.6-sol')).toBe('responses');
+    expect(resolveApiStyle('gpt-5.5')).toBe('chat');
+    expect(resolveApiStyle('gpt-4o')).toBe('chat');
+    expect(resolveApiStyle('o3')).toBe('chat');
+    // operator overrides bypass the heuristic in both directions
+    expect(resolveApiStyle('gpt-5.6-luna', 'chat')).toBe('chat');
+    expect(resolveApiStyle('gpt-4o', 'responses')).toBe('responses');
+  });
+
+  it('gpt-5.6 model is sent to /responses in the Responses request shape', async () => {
+    const { client, getResponsesArgs } = makeDualClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client, model: 'gpt-5.6-luna' });
+    const out = await provider.review(validInput);
+
+    expect(client.responses).toHaveBeenCalledTimes(1);
+    expect(client.chatCompletions).not.toHaveBeenCalled();
+    expect(out.findings).toHaveLength(0);
+
+    const args = getResponsesArgs();
+    // the system message travels as `instructions`, the rest as `input`
+    expect(typeof args.instructions).toBe('string');
+    expect('messages' in args).toBe(false);
+    expect(Array.isArray(args.input)).toBe(true);
+    for (const item of args.input as Array<{ role: string }>) {
+      expect(item.role).not.toBe('system');
+    }
+    // the tool is flat, not nested under `function`
+    const tools = args.tools as Array<Record<string, unknown>>;
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.name).toBe('submit_review_findings');
+    expect(Object.keys(tools[0] ?? {})).not.toContain('function');
+    // tool_choice keeps its reasoning-model value
+    expect(args.tool_choice).toBe('required');
+    // the output cap is spelled max_output_tokens, and neither chat spelling is sent
+    expect(args.max_output_tokens).toBe(4096);
+    expect('max_tokens' in args).toBe(false);
+    expect('max_completion_tokens' in args).toBe(false);
+    expect(args.store).toBe(false);
+  });
+
+  it('findings are read from the function_call output item', async () => {
+    const responses = vi.fn().mockResolvedValue(
+      responsesResponse({
+        findings: [
+          {
+            path: 'src/a.ts',
+            line: 3,
+            severity: 'medium',
+            category: 'correctness',
+            message: 'responses finding',
+            rationale: 'detected via the responses endpoint',
+            confidence: 0.8,
+          },
+        ],
+      }),
+    );
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), responses, textCompletion: vi.fn() },
+      model: 'gpt-5.6-sol',
+    });
+    const out = await provider.review(validInput);
+    expect(out.findings).toHaveLength(1);
+    expect(out.findings[0]?.message).toBe('responses finding');
+  });
+
+  it('an incomplete response with reason max_output_tokens throws output_truncated', async () => {
+    const responses = vi.fn().mockResolvedValue({
+      id: 'resp-truncated',
+      status: 'incomplete',
+      incomplete_details: { reason: 'max_output_tokens' },
+      output: [],
+    });
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions: vi.fn(), responses, textCompletion: vi.fn() },
+      model: 'gpt-5.6-sol',
+      maxOutputTokens: 8192,
+    });
+    await expect(provider.review(validInput)).rejects.toMatchObject({
+      name: 'ProviderErrorThrowable',
+      cause_kind: 'output_truncated',
+    });
+  });
+
+  it("apiStyle='chat' pins a gpt-5.6 model to /chat/completions", async () => {
+    const { client, getChatArgs } = makeDualClient();
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client,
+      model: 'gpt-5.6-luna',
+      apiStyle: 'chat',
+    });
+    await provider.review(validInput);
+    expect(client.chatCompletions).toHaveBeenCalledTimes(1);
+    expect(client.responses).not.toHaveBeenCalled();
+    expect(getChatArgs().max_completion_tokens).toBe(4096);
+  });
+
+  it("apiStyle='responses' routes a classic model to /responses with a flat forced tool", async () => {
+    const { client, getResponsesArgs } = makeDualClient();
+    const provider = new OpenAIProvider({ apiKey: 'k', client, apiStyle: 'responses' });
+    await provider.review(validInput); // gpt-4o default -> forced-specific tool_choice
+    expect(client.responses).toHaveBeenCalledTimes(1);
+    const toolChoice = getResponsesArgs().tool_choice as Record<string, unknown>;
+    expect(toolChoice.type).toBe('function');
+    expect(toolChoice.name).toBe('submit_review_findings');
+    expect(Object.keys(toolChoice)).not.toContain('function');
+  });
+
+  it('a client without a responses method keeps the chat path', async () => {
+    const chatCompletions = vi.fn().mockResolvedValue(chatCompletionsResponse({ findings: [] }));
+    const provider = new OpenAIProvider({
+      apiKey: 'k',
+      client: { chatCompletions, textCompletion: vi.fn() },
+      model: 'gpt-5.6-luna',
+    });
+    await provider.review(validInput);
+    expect(chatCompletions).toHaveBeenCalledTimes(1);
   });
 });

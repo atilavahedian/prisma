@@ -14,6 +14,7 @@ import { AnthropicProvider, type AnthropicProviderOptions } from '@prisma-bot/pr
 import { CopilotProvider, type CopilotProviderOptions } from '@prisma-bot/provider-copilot';
 import { FakeProvider } from '@prisma-bot/provider-fake';
 import {
+  type ApiStyle,
   OpenAIProvider,
   type OpenAIProviderOptions,
   type TokenParamStyle,
@@ -208,6 +209,17 @@ const buildProvider = async (secretSource: SecretSource): Promise<Provider> => {
     const toolChoiceRaw = await tryGetSecret(secretSource, 'OPENAI_TOOL_CHOICE');
     if (toolChoiceRaw === 'forced' || toolChoiceRaw === 'required' || toolChoiceRaw === 'auto') {
       opts.toolChoiceStyle = toolChoiceRaw as ToolChoiceStyle;
+    }
+    // OPENAI_API_STYLE, an optional override for the endpoint `review()` posts to.
+    // `auto` (default) sends the model families that reject function tools on
+    // /chat/completions (gpt-5.6*, gpt-6+) to /responses and leaves every other
+    // model where it is. `chat` pins /chat/completions; `responses` uses
+    // /responses for every model.
+    // Invalid values are silently ignored and fall back to `auto`.
+    // See deployment.md § Config and docs/model-compatibility.md for details.
+    const apiStyleRaw = await tryGetSecret(secretSource, 'OPENAI_API_STYLE');
+    if (apiStyleRaw === 'chat' || apiStyleRaw === 'responses' || apiStyleRaw === 'auto') {
+      opts.apiStyle = apiStyleRaw as ApiStyle;
     }
     log('worker.provider.selected', { provider: 'openai' });
     return new OpenAIProvider(opts);

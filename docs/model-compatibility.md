@@ -9,6 +9,42 @@ This document describes how the review bot handles different OpenAI model famili
 | Classic (proven) | `gpt-4o`, `gpt-4.1`, `gpt-4`, `gpt-3.5-turbo` | Forced-specific function object | `max_tokens` | Default behavior. Byte-identical to pre-v0.10.0 requests. No regression. |
 | Reasoning (gpt-5+) | `gpt-5`, `gpt-5.4-nano`, `gpt-5-nano` | `'required'` (auto) | `max_completion_tokens` | Reasoning models need `tool_choice: 'required'` to reason before calling the tool. |
 | Reasoning (o-series) | `o1`, `o3`, `o4-mini` | `'required'` (auto) | `max_completion_tokens` | Same as gpt-5+ family. Larger output budget recommended (`OPENAI_MAX_OUTPUT_TOKENS`). |
+| Reasoning, Responses-only tools | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | `'required'` (auto) | `max_output_tokens` | Function tools are rejected on `/chat/completions` for these families, so the review is sent to `/responses` (auto). |
+
+## Function tools rejected on /chat/completions
+
+**Symptom**: every review fails with a `capability` error and no findings are produced:
+
+```
+Review unavailable - the AI provider rejected the request (capability: Function tools with
+reasoning_effort are not supported for gpt-5.6-luna in /v1/chat/completions. To use function
+tools, use /v1/responses or set reasoning_effort to 'none'.)
+```
+
+**Root cause**: the gpt-5.6 families do not accept function tools on `/chat/completions` at
+any reasoning effort other than `none`, and the review flow always sends the single
+`submit_review_findings` tool.
+
+**The fix**: the adapter routes those models to `/responses`, which accepts the same tool and
+the same `tool_choice: 'required'`. The request is the same prompt and schema in the Responses
+spelling: the system message becomes `instructions`, the remaining turns become `input`, the
+tool is flat rather than nested under `function`, and the output cap is `max_output_tokens`.
+
+`reasoning_effort: 'none'` also clears the 400 and is **not** recommended: it turns reasoning
+off, and the failure mode that replaces the 400 is a malformed findings payload rather than a
+visible error, so reviews are dropped silently. Set `OPENAI_API_STYLE` if you need to pin an
+endpoint:
+
+```
+# Route the affected families to /responses, leave everything else on chat (default)
+OPENAI_API_STYLE=auto
+
+# Use /responses for every model
+OPENAI_API_STYLE=responses
+
+# Pin /chat/completions for every model (pre-Responses behavior)
+OPENAI_API_STYLE=chat
+```
 
 ## The empty-review symptom
 
@@ -71,4 +107,4 @@ A classic model returning zero findings on a real diff is a legitimately clean P
 
 ## Configuration reference
 
-See `docs/deployment.md` for the full env-var reference including `OPENAI_TOOL_CHOICE`, `OPENAI_TOKEN_PARAM`, and `OPENAI_MAX_OUTPUT_TOKENS`.
+See `docs/deployment.md` for the full env-var reference including `OPENAI_TOOL_CHOICE`, `OPENAI_TOKEN_PARAM`, `OPENAI_MAX_OUTPUT_TOKENS`, and `OPENAI_API_STYLE`.
