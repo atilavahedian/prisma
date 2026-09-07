@@ -89,34 +89,10 @@ export function resolveTokenParam(
 // ---------------------------------------------------------------------------
 
 /**
- * `RESPONSES_ONLY_TOOLS_RE`, the model families that reject function tools on
- * `/chat/completions` and must use `/responses` instead.
- *
- * The API says so itself, and names both remedies:
- *   "Function tools with reasoning_effort are not supported for gpt-5.6-luna in
- *    /v1/chat/completions. To use function tools, use /v1/responses or set
- *    reasoning_effort to 'none'."
- *
- * `reasoning_effort: 'none'` is not a remedy for this flow: it clears the 400
- * and then costs review quality (see docs/model-compatibility.md), and OpenAI's
- * own model guide states that the next family "does not support the `none`
- * reasoning effort" while "tool calling requires Responses". So the routing is
- * the remedy, and this regex is the set of families that need it:
- *   - `gpt-5.6*`            : sol, terra, luna
- *   - `gpt-[6-9]`, `gpt-\d{2,}` : later majors, same restriction
- *
- * Models that still accept function tools on `/chat/completions` (gpt-5.5 and
- * earlier, the o-series, and every classic family) are deliberately NOT matched:
- * they work today, and routing them would change a working path. Operators who
- * want `/responses` everywhere set `OPENAI_API_STYLE=responses`.
- */
-const RESPONSES_ONLY_TOOLS_RE = /^(gpt-5\.6|gpt-[6-9]|gpt-\d{2,})/i;
-
-/**
  * `ApiStyle`, the three possible endpoint selections for `review()`.
  *
- *   - `'auto'`      : heuristic (default); `/responses` for the families that
- *                     reject function tools on `/chat/completions`.
+ *   - `'auto'`      : heuristic (default); `/responses` for every
+ *                     reasoning-family model, `/chat/completions` otherwise.
  *   - `'chat'`      : always `/chat/completions` (the pre-Responses behavior).
  *   - `'responses'` : always `/responses`.
  *
@@ -127,6 +103,36 @@ export type ApiStyle = 'auto' | 'chat' | 'responses';
 /**
  * `resolveApiStyle`, a pure helper mapping a model identifier plus an optional
  * operator override to the endpoint `review()` will use.
+ *
+ * ## Why `auto` is the shared reasoning-family predicate
+ *
+ * The API names the constraint itself:
+ *   "Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+ *    /v1/chat/completions. To use function tools, use /v1/responses or set
+ *    reasoning_effort to 'none'."
+ *
+ * The rejection is a function of BOTH the family and the effective reasoning
+ * effort, and the effort is not reliably visible to this adapter: it can arrive
+ * as `provider_options.openai.reasoning_effort`, as a native `reasoning.effort`
+ * object, or as the model's own default when neither is set. Selecting on the
+ * family alone (an earlier draft matched only `gpt-5.6*` and later majors) left
+ * `gpt-5.5` with `reasoning_effort: high` — the configuration in the incident
+ * report — on `/chat/completions`, where OpenAI's migration guidance says tool
+ * calling is unsupported at any effort other than `none` from GPT-5.4 onward.
+ *
+ * `reasoning_effort: 'none'` is not a remedy for this flow: it clears the 400
+ * and then costs review quality (see docs/model-compatibility.md), and OpenAI's
+ * own model guide states that the next family "does not support the `none`
+ * reasoning effort" while "tool calling requires Responses".
+ *
+ * So `auto` delegates to `isReasoningModel` — the same shared predicate that
+ * already drives `resolveTokenParam` and `resolveToolChoice`, and the selector
+ * the issue proposed. One classification, three decisions, no third regex.
+ * Classic families (`gpt-4o`, `gpt-4.1`, `gpt-4`, `gpt-3.5-turbo`) stay on
+ * `/chat/completions` and their wire shape is byte-identical to before.
+ *
+ * A deployment behind an `OPENAI_BASE_URL` gateway that does not expose
+ * `/responses` pins `OPENAI_API_STYLE=chat`.
  *
  * @param model    - Bare model identifier (no `provider/` prefix).
  * @param override - Operator override from `OPENAI_API_STYLE`. Defaults to
@@ -139,28 +145,191 @@ export type ApiStyle = 'auto' | 'chat' | 'responses';
 export function resolveApiStyle(model: string, override: ApiStyle = 'auto'): 'chat' | 'responses' {
   if (override === 'chat') return 'chat';
   if (override === 'responses') return 'responses';
-  return RESPONSES_ONLY_TOOLS_RE.test(model) ? 'responses' : 'chat';
+  return isReasoningModel(model) ? 'responses' : 'chat';
 }
+
+/**
+ * `RESPONSES_STATE_LINKING_KEYS`, the request fields that would attach this
+ * one-shot review to server-side conversation state.
+ *
+ * `previous_response_id` continues a stored response chain and `conversation`
+ * attaches the call to a Conversation object with its own persistence
+ * semantics. Either can pull turns Prisma never rendered into a review, and
+ * neither is suppressed by `store: false` — `store` governs whether THIS
+ * response is retained, not whether prior state is read. A review is one call
+ * with one rendered prompt (issue #40 § Out of scope: "no follow-up turn"), so
+ * these fields are stripped unconditionally, in addition to being denylisted
+ * out of the passthrough bag upstream.
+ *
+ * Exported so tests can assert against the set directly.
+ */
+export const RESPONSES_STATE_LINKING_KEYS = ['previous_response_id', 'conversation'] as const;
 
 /**
  * `toResponsesArgs`, a pure mapping from the `/chat/completions` request Prisma
  * already builds to the `/responses` request shape.
  *
- * Only the spelling changes; every value is carried over:
+ * Spelling changes:
  *   - system message  -> `instructions` (multiple system messages are joined)
  *   - remaining turns -> `input`
  *   - nested tool     -> flat tool (`{ type, name, description, parameters }`)
  *   - forced tool     -> `{ type: 'function', name }`; `'required'` unchanged
- *   - token cap       -> `max_output_tokens` (whichever chat spelling was set)
+ *   - token cap       -> `max_output_tokens` (see § Output cap below)
  *   - `store: false`  -> Prisma does not use server-side response retention
  *
- * Passthrough keys from `provider_options.openai` (spec § 5.3) ride along
- * untouched, exactly as they do on the chat path.
+ * Passthrough keys from `provider_options.openai` (spec § 5.3) ride along, with
+ * four endpoint-aware exceptions. `/responses` is a different request contract
+ * from `/chat/completions`, not a rename of it, so a key that is valid on one
+ * is not automatically valid on the other, and `/responses` rejects unknown
+ * top-level parameters with HTTP 400.
+ *
+ * ## Reasoning effort
+ *
+ * `/chat/completions` spells it `reasoning_effort: 'high'`; `/responses` spells
+ * it `reasoning: { effort: 'high' }` and 400s on the flat key. The legacy field
+ * is therefore translated rather than forwarded — without this, the exact
+ * configuration in the incident report (`provider_options.openai.
+ * reasoning_effort: high`) trades a 400 on one endpoint for a 400 on the other.
+ *
+ * Precedence, when both spellings are supplied: **the native `reasoning` object
+ * wins, field by field.** `reasoning_effort` only fills `effort` when the
+ * native object does not set it, so `{ reasoning: { summary: 'auto' },
+ * reasoning_effort: 'high' }` yields `{ summary: 'auto', effort: 'high' }`,
+ * while `{ reasoning: { effort: 'xhigh' }, reasoning_effort: 'high' }` yields
+ * `{ effort: 'xhigh' }`. A native `reasoning` that is not a plain object is
+ * forwarded verbatim (the operator addressed the endpoint directly; the API
+ * validates it) and the legacy key is dropped with a note.
+ *
+ * ## Seed
+ *
+ * `/responses` has no `seed` field. `review()` sets one from
+ * `request_shaping.deterministic_seed`, and an operator can also put a raw
+ * `seed` in the passthrough bag; both are dropped here with a note rather than
+ * sent, because forwarding would 400 and silently keeping the
+ * `deterministic_seed` capability would promise a determinism this endpoint
+ * does not offer. `OpenAIProvider` reconciles `capabilities.deterministic_seed`
+ * for the resolved endpoint (see the constructor). Chat behavior is unchanged.
+ *
+ * ## Output cap
+ *
+ * One effective cap is resolved before serialization, honoring the documented
+ * `provider_options > generation > deployment default` precedence:
+ *
+ *   1. `provider_options.openai.max_output_tokens` — the native Responses
+ *      spelling. Highest precedence: it names this endpoint's own field.
+ *   2. `max_completion_tokens`, then `max_tokens` — the chat spellings, which
+ *      by this point already carry whichever of provider_options / generation /
+ *      deployment default won on the chat path (`applyProviderOptions` is
+ *      last-wins). Between the two, the newer-family spelling wins.
+ *
+ * Neither chat spelling reaches the wire. A non-numeric native override is
+ * ignored (with a note) in favor of the resolved chat value.
+ *
+ * @returns the mapped args plus key-only `notes` describing every dropped or
+ *          translated field. Notes never contain a value (G7).
  *
  * Exported for direct unit-testing.
  */
-export function toResponsesArgs(args: OpenAIChatCompletionsArgs): OpenAIResponsesArgs {
-  const { messages, tools, tool_choice, max_tokens, max_completion_tokens, ...passthrough } = args;
+export function toResponsesArgs(args: OpenAIChatCompletionsArgs): {
+  args: OpenAIResponsesArgs;
+  notes: string[];
+} {
+  const {
+    messages,
+    tools,
+    tool_choice,
+    max_tokens,
+    max_completion_tokens,
+    seed: _normalizedSeed,
+    ...rest
+  } = args;
+
+  const notes: string[] = [];
+  const inherited: Record<string, unknown> = rest;
+
+  /**
+   * Keys this function decides for itself. Everything else in the bag is
+   * forwarded verbatim. Built as an allow-through filter rather than a
+   * copy-then-delete so a handled key can never survive into the body by
+   * accident, and so the key is genuinely ABSENT (not merely `undefined`) in
+   * the object the client receives — an injected client inspects the object,
+   * not only its serialization.
+   */
+  const HANDLED_KEYS = new Set<string>([
+    'store',
+    'seed',
+    'reasoning',
+    'reasoning_effort',
+    'max_output_tokens',
+    ...RESPONSES_STATE_LINKING_KEYS,
+  ]);
+  const passthrough: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(inherited)) {
+    if (!HANDLED_KEYS.has(k)) passthrough[k] = v;
+  }
+
+  // --- one-shot boundary: no server-side state may be referenced -----------
+  for (const key of RESPONSES_STATE_LINKING_KEYS) {
+    if (key in inherited) {
+      notes.push(`${key} ignored (Prisma reviews are a single stateless call)`);
+    }
+  }
+  // `store` is Prisma-managed and pinned to the literal `false` set below.
+
+  // --- seed: not a Responses field ----------------------------------------
+  // Both spellings converge here: `review()` assigns `request_shaping
+  // .deterministic_seed` to `args.seed`, and `applyProviderOptions` merges a
+  // raw `provider_options.openai.seed` onto the same field (last wins). One
+  // destructure therefore covers both, and `seed` stays in HANDLED_KEYS so a
+  // future caller cannot reintroduce it through the passthrough bag.
+  if (_normalizedSeed !== undefined) {
+    notes.push('seed not sent: the Responses API has no deterministic seed parameter');
+  }
+
+  // --- reasoning effort: translate the legacy chat spelling ----------------
+  const legacyEffort = inherited.reasoning_effort;
+  const nativeReasoning = inherited.reasoning;
+
+  let reasoning: unknown;
+  const nativeIsPlainObject =
+    typeof nativeReasoning === 'object' &&
+    nativeReasoning !== null &&
+    !Array.isArray(nativeReasoning);
+  if (nativeIsPlainObject) {
+    const native = { ...(nativeReasoning as Record<string, unknown>) };
+    if (legacyEffort !== undefined) {
+      if (native.effort === undefined) {
+        native.effort = legacyEffort;
+        notes.push('reasoning_effort translated to reasoning.effort for the Responses API');
+      } else {
+        notes.push(
+          'reasoning_effort ignored: provider_options.openai.reasoning.effort takes precedence',
+        );
+      }
+    }
+    reasoning = native;
+  } else if (nativeReasoning !== undefined) {
+    // Not an object we can merge into — forward it and let the API validate.
+    reasoning = nativeReasoning;
+    if (legacyEffort !== undefined) {
+      notes.push('reasoning_effort ignored: provider_options.openai.reasoning takes precedence');
+    }
+  } else if (legacyEffort !== undefined) {
+    reasoning = { effort: legacyEffort };
+    notes.push('reasoning_effort translated to reasoning.effort for the Responses API');
+  }
+
+  // --- output cap: resolve exactly one value before serialization ----------
+  const nativeCap = inherited.max_output_tokens;
+  let cap: number | undefined;
+  if (typeof nativeCap === 'number') {
+    cap = nativeCap;
+  } else {
+    if (nativeCap !== undefined) {
+      notes.push('provider_options.openai.max_output_tokens ignored (not a number)');
+    }
+    cap = max_completion_tokens ?? max_tokens;
+  }
 
   const instructions = messages
     .filter((m) => m.role === 'system')
@@ -188,11 +357,13 @@ export function toResponsesArgs(args: OpenAIChatCompletionsArgs): OpenAIResponse
     store: false,
   };
 
-  const cap = max_completion_tokens ?? max_tokens;
+  if (reasoning !== undefined) {
+    responsesArgs.reasoning = reasoning;
+  }
   if (cap !== undefined) {
     responsesArgs.max_output_tokens = cap;
   }
-  return responsesArgs;
+  return { args: responsesArgs, notes };
 }
 
 // ---------------------------------------------------------------------------
@@ -295,9 +466,34 @@ export const OPENAI_PROVIDER_NAME = 'openai';
  * | n                | Multiple choices break the choices[0] extraction. |
  * | response_format  | Conflicts with the function-calling path. |
  *
- * `max_tokens` / `max_completion_tokens` / `seed` / `temperature` / `top_p`
- * are NOT denylisted — overriding them via escape hatch is the intended use
- * (AS-9, spec § 3.7 last paragraph).
+ * The Responses API spells four of the same Prisma-managed concerns
+ * differently, and adds two that only exist on that endpoint. Since one bag
+ * feeds both endpoints, they are protected in the same list — none of them is
+ * a valid `/chat/completions` field either, so nothing on the chat path
+ * changes except that an operator now gets a note instead of silence.
+ *
+ * | Key                  | Why protected |
+ * |----------------------|---------------|
+ * | input                | The Responses spelling of `messages`. |
+ * | instructions         | The Responses spelling of the system message. |
+ * | store                | Retention is Prisma-managed and pinned to `false`:
+ *                          diff hunks and context files are customer source
+ *                          (G7). |
+ * | previous_response_id | Continues a stored response chain — would pull
+ *                          turns Prisma never rendered into the review. |
+ * | conversation         | Attaches the call to a Conversation object with its
+ *                          own persistence semantics; `store: false` does not
+ *                          suppress it. |
+ *
+ * The last two are also stripped defensively in `toResponsesArgs`
+ * (`RESPONSES_STATE_LINKING_KEYS`) so the one-shot boundary does not depend on
+ * this list alone.
+ *
+ * `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `seed` /
+ * `temperature` / `top_p` / `reasoning_effort` / `reasoning` are NOT
+ * denylisted — overriding them via escape hatch is the intended use (AS-9,
+ * spec § 3.7 last paragraph). `toResponsesArgs` translates or drops those that
+ * the Responses contract spells differently or does not accept.
  *
  * Exported so unit tests can assert against it directly (spec § 7.2, G8).
  */
@@ -309,6 +505,12 @@ export const OPENAI_PASSTHROUGH_DENYLIST = new Set<string>([
   'stream',
   'n',
   'response_format',
+  // Responses-API spellings of the same Prisma-managed fields (issue #40).
+  'input',
+  'instructions',
+  'store',
+  'previous_response_id',
+  'conversation',
 ]);
 
 /**
@@ -542,6 +744,49 @@ export interface OpenAIProviderOptions {
    * Wired from OPENAI_API_STYLE env var (deployment.md - Config).
    */
   apiStyle?: ApiStyle;
+  /**
+   * `onUsage` — optional sink for per-call token telemetry (see
+   * `OpenAIUsageTelemetry`). Called once per `review()` provider call, after
+   * the response arrives and BEFORE truncation detection, so a call that hit
+   * the output cap still reports where the budget went.
+   *
+   * Additive and adapter-local: the `Provider` interface and
+   * `ProviderReviewOutput` are unchanged (issue #40 § Out of scope). The worker
+   * wires this to the process logger as the `provider.usage` audit event.
+   *
+   * Never allowed to fail a review — the adapter swallows anything this throws.
+   */
+  onUsage?: (usage: OpenAIUsageTelemetry) => void;
+}
+
+/**
+ * `OpenAIUsageTelemetry` — vendor-neutral token accounting for one provider
+ * call, normalized across the two endpoints' different spellings:
+ *
+ * | Field                | `/chat/completions`                          | `/responses`                              |
+ * |----------------------|----------------------------------------------|-------------------------------------------|
+ * | `input_tokens`       | `usage.prompt_tokens`                        | `usage.input_tokens`                      |
+ * | `output_tokens`      | `usage.completion_tokens`                    | `usage.output_tokens`                     |
+ * | `cached_input_tokens`| `usage.prompt_tokens_details.cached_tokens`  | `usage.input_tokens_details.cached_tokens`|
+ * | `reasoning_tokens`   | `usage.completion_tokens_details.reasoning_tokens` | `usage.output_tokens_details.reasoning_tokens` |
+ *
+ * `reasoning_tokens` is the field that answers the operating question behind
+ * issue #40: whether a large `max_output_tokens` was consumed by reasoning or
+ * by findings. Fields the endpoint did not report are omitted rather than
+ * zero-filled, so absent and zero stay distinguishable.
+ *
+ * Counts only. No prompt or response content is carried (observability.md:
+ * the adapter never logs request or response bodies).
+ */
+export interface OpenAIUsageTelemetry {
+  /** Which endpoint served the call. */
+  endpoint: 'chat' | 'responses';
+  /** The model actually sent, after `request_shaping.model` resolution. */
+  model: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_input_tokens?: number;
+  reasoning_tokens?: number;
 }
 
 interface ToolCall {
@@ -670,6 +915,51 @@ function extractResponsesToolCallArguments(response: unknown, toolName: string):
 }
 
 /**
+ * `extractUsage` — read the token-accounting block from either endpoint's
+ * response into the normalized `OpenAIUsageTelemetry` shape.
+ *
+ * Tolerant by construction: a response with no `usage` object, a partial one,
+ * or non-numeric fields yields a record carrying only `endpoint` and `model`.
+ * Telemetry must never be able to fail a review.
+ *
+ * Exported for direct unit-testing.
+ */
+export function extractUsage(
+  response: unknown,
+  endpoint: 'chat' | 'responses',
+  model: string,
+): OpenAIUsageTelemetry {
+  const out: OpenAIUsageTelemetry = { endpoint, model };
+  if (typeof response !== 'object' || response === null) return out;
+  const usage = (response as Record<string, unknown>).usage;
+  if (typeof usage !== 'object' || usage === null) return out;
+  const u = usage as Record<string, unknown>;
+
+  const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+  const detail = (key: string, field: string): number | undefined => {
+    const d = u[key];
+    if (typeof d !== 'object' || d === null) return undefined;
+    return num((d as Record<string, unknown>)[field]);
+  };
+
+  // `/responses` spells them input/output; `/chat/completions` prompt/completion.
+  const input = num(u.input_tokens) ?? num(u.prompt_tokens);
+  const output = num(u.output_tokens) ?? num(u.completion_tokens);
+  const cached =
+    detail('input_tokens_details', 'cached_tokens') ??
+    detail('prompt_tokens_details', 'cached_tokens');
+  const reasoning =
+    detail('output_tokens_details', 'reasoning_tokens') ??
+    detail('completion_tokens_details', 'reasoning_tokens');
+
+  if (input !== undefined) out.input_tokens = input;
+  if (output !== undefined) out.output_tokens = output;
+  if (cached !== undefined) out.cached_input_tokens = cached;
+  if (reasoning !== undefined) out.reasoning_tokens = reasoning;
+  return out;
+}
+
+/**
  * Detect an output-cap truncation on either endpoint.
  *
  * `/chat/completions` reports it as `choices[0].finish_reason === 'length'`;
@@ -783,9 +1073,11 @@ export class OpenAIProvider implements Provider {
   private readonly maxOutputTokens: number;
   private readonly toolChoiceStyle: ToolChoiceStyle;
   private readonly apiStyle: ApiStyle;
+  private readonly onUsage: ((usage: OpenAIUsageTelemetry) => void) | undefined;
 
   constructor(options: OpenAIProviderOptions) {
     this.model = options.model ?? OPENAI_DEFAULT_MODEL;
+    this.apiStyle = options.apiStyle ?? 'auto';
     // Phase 2: derive tokenizer_family from the resolved model unless the
     // caller provides explicit capabilities (e.g. tests with a mock window).
     const baseCapabilities = options.capabilities ?? OPENAI_CAPABILITIES;
@@ -793,12 +1085,25 @@ export class OpenAIProvider implements Provider {
       ...baseCapabilities,
       tokenizer_family:
         options.capabilities?.tokenizer_family ?? resolveOpenAITokenizerFamily(this.model),
+      // Capability honesty (ADR-005 § Rationale, contributing.md § "Declare
+      // capabilities honestly"): `seed` exists on `/chat/completions` and does
+      // not exist on `/responses`, so `deterministic_seed` is a property of the
+      // resolved endpoint, not of the vendor. Derived from the deployment model
+      // + apiStyle here; an explicit `capabilities.deterministic_seed` from the
+      // caller still wins, mirroring the tokenizer_family precedent above.
+      //
+      // A per-request `request_shaping.model` can route a single call
+      // differently from the deployment default; `toResponsesArgs` emits a note
+      // in that case rather than silently dropping the seed.
+      deterministic_seed:
+        options.capabilities?.deterministic_seed ??
+        resolveApiStyle(this.model, this.apiStyle) === 'chat',
     };
     this.maxTokensPerCall = options.maxTokensPerCall;
     this.tokenParamStyle = options.tokenParamStyle ?? 'auto';
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
     this.toolChoiceStyle = options.toolChoiceStyle ?? 'auto';
-    this.apiStyle = options.apiStyle ?? 'auto';
+    this.onUsage = options.onUsage;
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
@@ -941,15 +1246,32 @@ export class OpenAIProvider implements Provider {
 
     let response: unknown;
     try {
-      response =
-        responsesCall !== undefined && useResponses
-          ? await responsesCall(toResponsesArgs(args))
-          : await this.client.chatCompletions(args);
+      if (responsesCall !== undefined && useResponses) {
+        // The endpoint-aware translation (reasoning spelling, seed, state
+        // linking, output cap) happens here, once, immediately before the
+        // call. `notes` are key-only by construction (G7).
+        const { args: responsesArgs } = toResponsesArgs(args);
+        response = await responsesCall(responsesArgs);
+      } else {
+        response = await this.client.chatCompletions(args);
+      }
     } catch (err) {
       if (err instanceof ProviderErrorThrowable) {
         throw err;
       }
       throw new ProviderErrorThrowable(mapOpenAIError(err));
+    }
+
+    // Token telemetry. Emitted before truncation detection so a call that hit
+    // the output cap still reports whether reasoning or findings consumed it
+    // (issue #40 § "token usage is recorded from the Responses usage object").
+    // Never allowed to fail a review.
+    if (this.onUsage !== undefined) {
+      try {
+        this.onUsage(extractUsage(response, useResponses ? 'responses' : 'chat', model));
+      } catch {
+        // telemetry is best-effort
+      }
     }
 
     // Detect response truncation: the model hit the output token cap and the

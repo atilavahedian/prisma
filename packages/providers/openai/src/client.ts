@@ -91,7 +91,13 @@ export interface OpenAIChatCompletionsArgs {
  *     nested under a `function` key;
  *   - the output cap is `max_output_tokens` (neither `max_tokens` nor
  *     `max_completion_tokens` is accepted);
+ *   - reasoning effort is a `reasoning: { effort }` object, not the flat
+ *     `reasoning_effort` field the chat endpoint takes;
+ *   - there is no `seed`;
  *   - `store` controls server-side retention; Prisma sends `false`.
+ *
+ * The endpoint rejects unknown top-level parameters with HTTP 400, so a chat
+ * field cannot simply ride along.
  *
  * `tool_choice: 'required'` keeps its meaning and its wire value. The mapping
  * from `OpenAIChatCompletionsArgs` lives in `toResponsesArgs` (index.ts) so
@@ -115,6 +121,14 @@ export interface OpenAIResponsesArgs {
   tool_choice: 'required' | { type: 'function'; name: string };
   /** Output token cap. The Responses API accepts only this spelling. */
   max_output_tokens?: number;
+  /**
+   * Reasoning configuration. `toResponsesArgs` builds this from a native
+   * `provider_options.openai.reasoning` object and/or the legacy
+   * `reasoning_effort` chat spelling. Typed as `unknown` because the object's
+   * own fields (`effort`, `summary`, …) are the vendor's contract, not this
+   * adapter's — the adapter only guarantees the key.
+   */
+  reasoning?: unknown;
   /** Server-side retention of the response. Prisma sends `false`. */
   store?: boolean;
   temperature?: number;
